@@ -38,7 +38,6 @@ from urllib.parse import urlencode
 
 try:
     from playwright.async_api import async_playwright, BrowserContext, Page
-    from playwright_stealth import stealth_async
     from bs4 import BeautifulSoup
     import pgeocode
     from rich.console import Console
@@ -46,8 +45,25 @@ try:
     from rich import box
 except ImportError as e:
     print(f"[ERROR] Missing dependency: {e}")
-    print("Run: pip install -r requirements.txt && playwright install chromium")
+    print("Run: python -m pip install -r requirements.txt && python -m playwright install chromium")
     sys.exit(1)
+
+# playwright-stealth v1 uses stealth_async(); v2 uses Stealth().apply_stealth_async()
+# This wrapper handles both versions transparently.
+try:
+    from playwright_stealth import stealth_async as _stealth_v1
+    async def _apply_stealth(page):
+        await _stealth_v1(page)
+except ImportError:
+    try:
+        from playwright_stealth import Stealth as _Stealth
+        _stealth_instance = _Stealth()
+        async def _apply_stealth(page):
+            await _stealth_instance.apply_stealth_async(page)
+    except Exception:
+        # stealth unavailable entirely — continue without it
+        async def _apply_stealth(page):
+            pass
 
 
 FB_LOGIN_URL = "https://www.facebook.com/login"
@@ -985,9 +1001,9 @@ async def main() -> None:
 
         # Apply stealth to all pages
         fb_page = await context.new_page()
-        await stealth_async(fb_page)
+        await _apply_stealth(fb_page)
         at_page = await context.new_page()
-        await stealth_async(at_page)
+        await _apply_stealth(at_page)
 
         try:
             # --- Facebook login & scraping ---
