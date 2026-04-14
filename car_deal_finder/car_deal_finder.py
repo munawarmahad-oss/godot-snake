@@ -257,6 +257,22 @@ def build_fb_search_url(lat: float, lon: float, args: argparse.Namespace) -> str
     return FB_MARKETPLACE_BASE + "?" + urlencode(params)
 
 
+async def _human_type(page: Page, selector: str, text: str) -> None:
+    """
+    Click a field and type text one character at a time with small random
+    delays. This is necessary for React-controlled inputs (like Facebook's)
+    where page.fill() inserts text but React never registers the change,
+    leaving the field visually empty when the login button is clicked.
+    """
+    el = page.locator(selector).first
+    await el.click()
+    await asyncio.sleep(random.uniform(0.3, 0.6))
+    # Triple-click to select any pre-filled placeholder text, then overwrite
+    await el.triple_click()
+    await asyncio.sleep(0.2)
+    await page.keyboard.type(text, delay=random.randint(60, 130))
+
+
 async def fb_login(page: Page, email: str, password: str) -> None:
     """Log into Facebook. Handles cookie banners, slow loads, and 2FA."""
     console.print("[cyan]Logging into Facebook...[/cyan]")
@@ -267,13 +283,11 @@ async def fb_login(page: Page, email: str, password: str) -> None:
     await asyncio.sleep(random.uniform(2.0, 3.5))
 
     # Dismiss cookie / consent banners that can block the login form.
-    # Facebook uses several different banners depending on region.
     cookie_selectors = [
         "[data-cookiebanner='accept_button']",
         "button[title='Accept all']",
         "button[title='Allow all cookies']",
         "[data-testid='cookie-policy-manage-dialog-accept-button']",
-        "button[data-testid='royal_login_button']",   # sometimes overlaps
         "div[aria-label='Allow all cookies'] button",
         "button:has-text('Accept All')",
         "button:has-text('Allow')",
@@ -288,19 +302,18 @@ async def fb_login(page: Page, email: str, password: str) -> None:
         except Exception:
             continue
 
-    # Try multiple selectors for the email field — Facebook occasionally
-    # restructures the login form between regions/experiments.
+    # Wait for the email field to appear
     email_selectors = ["#email", "input[name='email']", "input[type='email']"]
-    email_found = False
+    email_sel_found = None
     for sel in email_selectors:
         try:
             await page.wait_for_selector(sel, timeout=15000)
-            email_found = True
+            email_sel_found = sel
             break
         except Exception:
             continue
 
-    if not email_found:
+    if not email_sel_found:
         if "facebook.com/login" not in page.url and "facebook.com" in page.url:
             console.print("[dim]Already logged in — continuing.[/dim]")
             return
@@ -310,30 +323,31 @@ async def fb_login(page: Page, email: str, password: str) -> None:
             "to watch what the browser is doing."
         )
 
-    # Fill email
-    for sel in email_selectors:
-        try:
-            await page.fill(sel, email)
-            break
-        except Exception:
-            continue
+    # Type email character-by-character so React registers every keystroke
+    console.print("[dim]Typing email...[/dim]")
+    await _human_type(page, email_sel_found, email)
+    await asyncio.sleep(random.uniform(0.5, 1.0))
 
-    await asyncio.sleep(random.uniform(0.4, 0.8))
-
-    # Fill password
+    # Move to password field and type
     pass_selectors = ["#pass", "input[name='pass']", "input[type='password']"]
+    pass_sel_found = None
     for sel in pass_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=3000):
-                await el.fill(password)
+            if await el.is_visible(timeout=5000):
+                pass_sel_found = sel
                 break
         except Exception:
             continue
 
-    await asyncio.sleep(random.uniform(0.4, 0.8))
+    if not pass_sel_found:
+        raise RuntimeError("Could not find the password field on the Facebook login page.")
 
-    # Click login button
+    console.print("[dim]Typing password...[/dim]")
+    await _human_type(page, pass_sel_found, password)
+    await asyncio.sleep(random.uniform(0.5, 1.0))
+
+    # Click the Log In button
     login_selectors = [
         "button[name='login']",
         "button[type='submit']",
@@ -348,6 +362,8 @@ async def fb_login(page: Page, email: str, password: str) -> None:
                 break
         except Exception:
             continue
+
+    console.print("[dim]Waiting for Facebook to respond...[/dim]")
 
     # Wait for navigation away from the login page
     try:
@@ -369,8 +385,7 @@ async def fb_login(page: Page, email: str, password: str) -> None:
                 timeout=8000,
             )
             code = input("Enter the Facebook verification code sent to your phone: ").strip()
-            await page.fill("input[name='approvals_code']", code)
-            # Try multiple submit button selectors
+            await _human_type(page, "input[name='approvals_code']", code)
             for sel in ["#checkpointSubmitButton", "button[type='submit']"]:
                 try:
                     btn = page.locator(sel).first
@@ -383,7 +398,7 @@ async def fb_login(page: Page, email: str, password: str) -> None:
         except Exception:
             pass
 
-    # Final check — make sure we are no longer on login/checkpoint
+    # Final check
     current = page.url
     if "/login" in current or "/checkpoint" in current:
         raise RuntimeError(
