@@ -394,7 +394,89 @@ async def fb_login(page: Page, email: str, password: str) -> None:
     console.print("[green]Facebook login successful.[/green]")
 
 
-def find_feed_units(data) -> Optional[list]:
+async def _is_logged_in(page: Page) -> bool:
+    """
+    Return True if the current page shows a logged-in Facebook session.
+    Checks for the presence of the top navigation (only visible when logged in)
+    and the absence of a login form in the page body.
+    """
+    try:
+        # The main FB nav bar / profile icon only renders when logged in
+        nav = await page.query_selector(
+            "[aria-label='Facebook'], [data-testid='royal_login_button'], "
+            "div[role='navigation'] a[href*='/me/'], "
+            "div[role='banner'] [href*='profile.php']"
+        )
+        # If a login button is visible in the page body, we are NOT logged in
+        login_btn = await page.query_selector("button[name='login'], input[type='submit'][value='Log In']")
+        if login_btn:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _close_marketplace_login_popup(page: Page) -> bool:
+    """
+    Detect and close the 'Log in to continue' popup Facebook shows on
+    Marketplace when the session is stale. Returns True if a popup was found.
+    """
+    popup_selectors = [
+        # The ✕ close button on the login dialog
+        "[aria-label='Close']",
+        "div[role='dialog'] [aria-label='Close']",
+        # Some regions show a dismiss button labeled differently
+        "div[role='dialog'] button:has-text('Not now')",
+        "div[role='dialog'] button:has-text('Close')",
+    ]
+    for sel in popup_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=3000):
+                await btn.click()
+                await asyncio.sleep(1.5)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _verify_or_refresh_login(
+    page: Page,
+    context: BrowserContext,
+    email: str,
+    password: str,
+    session_file: str,
+) -> None:
+    """
+    Navigate to Facebook home and confirm the session is still valid.
+    If not, delete the stale session file and perform a fresh login.
+    """
+    console.print("[dim]Verifying Facebook session...[/dim]")
+    try:
+        await page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(2.0)
+    except Exception:
+        pass
+
+    # Redirect to /login means definitely not logged in
+    if "/login" in page.url:
+        logged_in = False
+    else:
+        logged_in = await _is_logged_in(page)
+
+    if not logged_in:
+        console.print("[yellow]Session expired — logging in again...[/yellow]")
+        # Remove stale session file so it gets replaced after fresh login
+        stale = pathlib.Path(session_file)
+        if stale.exists():
+            stale.unlink()
+        await fb_login(page, email, password)
+        await save_session(context, session_file)
+    else:
+        console.print("[dim]Session valid.[/dim]")
+
+
     """
     Recursively walk a nested dict/list to find the 'feed_units' key.
     Facebook's GraphQL response schema reshuffles the top-level namespace
@@ -615,6 +697,8 @@ async def scrape_facebook(
     args: argparse.Namespace,
     lat: float,
     lon: float,
+    email: str = "",
+    password: str = "",
 ) -> list[FBListing]:
     """
     Navigate to FB Marketplace and intercept GraphQL responses to collect listings.
@@ -641,6 +725,34 @@ async def scrape_facebook(
     except Exception:
         # networkidle can time out on slow connections — proceed anyway
         pass
+
+    # After landing on Marketplace, check whether Facebook is showing a
+    # "Log in to continue" popup — this happens when the saved session has
+    # expired. If found, close it, go log in properly, then reload the page.
+    await asyncio.sleep(2.0)
+    login_popup_visible = False
+    try:
+        popup = await page.query_selector("div[role='dialog'] input[name='email'], "
+                                          "div[role='dialog'] button[name='login']")
+        if popup:
+            login_popup_visible = True
+    except Exception:
+        pass
+
+    if login_popup_visible:
+        console.print("[yellow]Login popup detected on Marketplace — session expired.[/yellow]")
+        page.remove_listener("response", handle_response)
+        collected_responses.clear()
+        # Close the popup if possible, then do a real login
+        await _close_marketplace_login_popup(page)
+        await fb_login(page, email, password)
+        # Re-register listener and reload the search page
+        page.on("response", handle_response)
+        console.print("[dim]Session refreshed.[/dim]")
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+        except Exception:
+            pass
 
     # Scroll to lazy-load more listings
     scroll_rounds = math.ceil(args.max_listings / 20)
@@ -1099,18 +1211,15 @@ async def main() -> None:
 
         try:
             # --- Facebook login & scraping ---
-            needs_login = not pathlib.Path(args.session_file).exists()
-            if not needs_login:
-                # Quick check: navigate to FB and see if we're still logged in
-                await fb_page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=15000)
-                if "login" in fb_page.url:
-                    needs_login = True
-
-            if needs_login:
+            if not pathlib.Path(args.session_file).exists():
+                # No saved session — log in fresh
                 await fb_login(fb_page, email, password)
                 await save_session(context, args.session_file)
+            else:
+                # Session file exists — verify it is still valid and re-login if not
+                await _verify_or_refresh_login(fb_page, context, email, password, args.session_file)
 
-            fb_listings = await scrape_facebook(fb_page, args, lat, lon)
+            fb_listings = await scrape_facebook(fb_page, args, lat, lon, email, password)
 
             if not fb_listings:
                 console.print(
