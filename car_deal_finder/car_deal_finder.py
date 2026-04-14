@@ -258,47 +258,139 @@ def build_fb_search_url(lat: float, lon: float, args: argparse.Namespace) -> str
 
 
 async def fb_login(page: Page, email: str, password: str) -> None:
-    """Log into Facebook. Handles 2FA prompt if present."""
+    """Log into Facebook. Handles cookie banners, slow loads, and 2FA."""
     console.print("[cyan]Logging into Facebook...[/cyan]")
-    await page.goto(FB_LOGIN_URL, wait_until="domcontentloaded")
 
-    try:
-        await page.wait_for_selector("#email", timeout=10000)
-    except Exception:
-        # May already be logged in or on a different page
-        if "facebook.com/login" not in page.url:
-            console.print("[dim]Already logged in or login page not found — continuing.[/dim]")
+    await page.goto(FB_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+
+    # Give the page extra time to settle — Facebook sometimes renders slowly
+    await asyncio.sleep(random.uniform(2.0, 3.5))
+
+    # Dismiss cookie / consent banners that can block the login form.
+    # Facebook uses several different banners depending on region.
+    cookie_selectors = [
+        "[data-cookiebanner='accept_button']",
+        "button[title='Accept all']",
+        "button[title='Allow all cookies']",
+        "[data-testid='cookie-policy-manage-dialog-accept-button']",
+        "button[data-testid='royal_login_button']",   # sometimes overlaps
+        "div[aria-label='Allow all cookies'] button",
+        "button:has-text('Accept All')",
+        "button:has-text('Allow')",
+    ]
+    for sel in cookie_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=2000):
+                await btn.click()
+                await asyncio.sleep(1.0)
+                break
+        except Exception:
+            continue
+
+    # Try multiple selectors for the email field — Facebook occasionally
+    # restructures the login form between regions/experiments.
+    email_selectors = ["#email", "input[name='email']", "input[type='email']"]
+    email_found = False
+    for sel in email_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=15000)
+            email_found = True
+            break
+        except Exception:
+            continue
+
+    if not email_found:
+        if "facebook.com/login" not in page.url and "facebook.com" in page.url:
+            console.print("[dim]Already logged in — continuing.[/dim]")
             return
-        raise RuntimeError("Facebook login page did not load correctly.")
+        raise RuntimeError(
+            "Facebook login page did not load. "
+            "Check your internet connection and try again with --no-headless "
+            "to watch what the browser is doing."
+        )
 
-    await page.fill("#email", email)
-    await asyncio.sleep(random.uniform(0.3, 0.7))
-    await page.fill("#pass", password)
-    await asyncio.sleep(random.uniform(0.3, 0.7))
-    await page.click("button[name='login']")
+    # Fill email
+    for sel in email_selectors:
+        try:
+            await page.fill(sel, email)
+            break
+        except Exception:
+            continue
 
+    await asyncio.sleep(random.uniform(0.4, 0.8))
+
+    # Fill password
+    pass_selectors = ["#pass", "input[name='pass']", "input[type='password']"]
+    for sel in pass_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3000):
+                await el.fill(password)
+                break
+        except Exception:
+            continue
+
+    await asyncio.sleep(random.uniform(0.4, 0.8))
+
+    # Click login button
+    login_selectors = [
+        "button[name='login']",
+        "button[type='submit']",
+        "[data-testid='royal_login_button']",
+        "input[type='submit'][value='Log In']",
+    ]
+    for sel in login_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=3000):
+                await btn.click()
+                break
+        except Exception:
+            continue
+
+    # Wait for navigation away from the login page
     try:
-        await page.wait_for_url("**/facebook.com/**", timeout=15000)
+        await page.wait_for_function(
+            "() => !window.location.href.includes('/login')",
+            timeout=20000,
+        )
     except Exception:
         pass
 
+    await asyncio.sleep(2.0)
+
     # Handle 2FA / checkpoint
     if "checkpoint" in page.url or "two_step" in page.url:
+        console.print("[yellow]Facebook is asking for a verification code.[/yellow]")
         try:
-            await page.wait_for_selector("input[name='approvals_code']", timeout=5000)
-            code = input("Facebook 2FA code: ").strip()
+            await page.wait_for_selector(
+                "input[name='approvals_code'], input[id*='approvals']",
+                timeout=8000,
+            )
+            code = input("Enter the Facebook verification code sent to your phone: ").strip()
             await page.fill("input[name='approvals_code']", code)
-            await page.click("#checkpointSubmitButton")
-            await asyncio.sleep(3)
+            # Try multiple submit button selectors
+            for sel in ["#checkpointSubmitButton", "button[type='submit']"]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        break
+                except Exception:
+                    continue
+            await asyncio.sleep(4.0)
         except Exception:
             pass
 
-    # Verify we are no longer on the login page
-    if "login" in page.url:
+    # Final check — make sure we are no longer on login/checkpoint
+    current = page.url
+    if "/login" in current or "/checkpoint" in current:
         raise RuntimeError(
-            "Facebook login failed. Check FB_EMAIL and FB_PASSWORD, "
-            "or run with --no-headless to debug."
+            "Facebook login failed. Make sure FB_EMAIL and FB_PASSWORD are correct.\n"
+            "Run with --no-headless to watch the browser and see what went wrong."
         )
+
     console.print("[green]Facebook login successful.[/green]")
 
 
