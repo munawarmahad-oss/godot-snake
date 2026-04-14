@@ -551,6 +551,7 @@ async def _verify_or_refresh_login(
         console.print("[dim]Session valid.[/dim]")
 
 
+def find_feed_units(data) -> Optional[list]:
     """
     Recursively walk a nested dict/list to find the 'feed_units' key.
     Facebook's GraphQL response schema reshuffles the top-level namespace
