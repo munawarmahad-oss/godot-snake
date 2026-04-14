@@ -3,8 +3,9 @@
 car_deal_finder.py
 ------------------
 Scrapes Facebook Marketplace for used car listings, cross-references each
-against AutoTempest.com to compute a median market price, and flags listings
-that are >= min_discount % below market as flip candidates.
+against AutoTempest.com's Price Trends feature (/price-trends) to compute a
+median market price from both current and historical listings, and flags
+listings that are >= min_discount % below market as flip candidates.
 
 Usage:
     python car_deal_finder.py --make toyota --model camry \
@@ -51,7 +52,7 @@ except ImportError as e:
 
 FB_LOGIN_URL = "https://www.facebook.com/login"
 FB_MARKETPLACE_BASE = "https://www.facebook.com/marketplace/category/vehicles"
-AT_RESULTS_BASE = "https://www.autotempest.com/results"
+AT_PRICE_TRENDS_BASE = "https://www.autotempest.com/price-trends"
 
 DEFAULT_DISCOUNT_THRESHOLD = 25   # % below market to flag as deal
 DEFAULT_DAYS_LISTED = 7           # only listings posted within this many days
@@ -570,6 +571,13 @@ async def scrape_facebook(
 # --- AUTOTEMPEST SCRAPER ---
 
 def build_at_url(make: str, model: str, year: int, zip_code: str, radius: int) -> str:
+    """
+    Build an AutoTempest Price Trends URL for a specific make/model/year.
+
+    Price Trends (/price-trends) differs from /results in that it returns
+    both current AND historical listings, yielding a much larger price sample
+    and a more reliable market median. It accepts the same GET parameters.
+    """
     params = {
         "make": make.lower(),
         "model": model.lower(),
@@ -578,14 +586,73 @@ def build_at_url(make: str, model: str, year: int, zip_code: str, radius: int) -
         "minyear": year,
         "maxyear": year,
     }
-    return AT_RESULTS_BASE + "?" + urlencode(params)
+    return AT_PRICE_TRENDS_BASE + "?" + urlencode(params)
+
+
+def _extract_prices_from_json(data) -> list[int]:
+    """
+    Recursively search a JSON object (dict or list) for numeric price values.
+    AutoTempest's Price Trends chart data is loaded via XHR; when intercepted
+    it arrives as a JSON blob with nested price arrays.
+    """
+    found = []
+    if isinstance(data, dict):
+        for key, val in data.items():
+            # Keys that commonly hold price data in chart/trend APIs
+            if key.lower() in ("price", "prices", "amount", "value", "median",
+                               "average", "mean", "listing_price", "sale_price"):
+                if isinstance(val, (int, float)) and 500 < val < 500000:
+                    found.append(int(val))
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, (int, float)) and 500 < v < 500000:
+                            found.append(int(v))
+            else:
+                found.extend(_extract_prices_from_json(val))
+    elif isinstance(data, list):
+        for item in data:
+            found.extend(_extract_prices_from_json(item))
+    return found
 
 
 def parse_at_page(html: str) -> list[int]:
-    """Extract numeric prices from an AutoTempest results page."""
+    """
+    Extract numeric prices from an AutoTempest Price Trends page.
+
+    Strategy (in order of preference):
+    1. Displayed aggregate stat — Price Trends shows a median/average price
+       prominently near the chart. Try BEM selectors for those summary numbers.
+    2. Individual listing cards — li.result-list-item with .badge__label.label--price
+       (same markup as /results; Price Trends includes historical listings too).
+    3. Broad fallback — any element whose class contains "price".
+    """
     soup = BeautifulSoup(html, "lxml")
     prices = []
 
+    # 1. Try to grab the displayed aggregate stat from the Price Trends chart summary.
+    #    Common patterns: .price-trend__stat, .trend-summary, .chart-stat, [class*="trend"]
+    aggregate_selectors = [
+        ".price-trend__stat",
+        ".trend-summary__price",
+        ".chart-summary__value",
+        '[class*="trend"][class*="stat"]',
+        '[class*="trend"][class*="price"]',
+        '[class*="chart"][class*="price"]',
+        '[class*="summary"][class*="price"]',
+    ]
+    for sel in aggregate_selectors:
+        for el in soup.select(sel):
+            text = el.get_text(strip=True)
+            if re.search(r"\d", text):
+                cleaned = re.sub(r"[^\d]", "", text)
+                if cleaned:
+                    val = int(cleaned)
+                    if 500 < val < 500000:
+                        prices.append(val)
+        if prices:
+            break  # stop once we've found the aggregate stat
+
+    # 2. Individual listing cards (current + historical on Price Trends page).
     for item in soup.select("li.result-list-item"):
         try:
             # Primary selector: BEM-named price badge
@@ -608,7 +675,7 @@ def parse_at_page(html: str) -> list[int]:
         except (ValueError, AttributeError):
             continue
 
-    # If the list-item selector found nothing, try a broader sweep
+    # 3. Broad fallback — sweep for any price-bearing element
     if not prices:
         for el in soup.select('[class*="price"], [data-price]'):
             text = el.get_text(strip=True)
@@ -639,22 +706,44 @@ async def fetch_at_prices(
     radius: int,
     cache: dict,
 ) -> list[int]:
-    """Fetch AutoTempest prices for a make/model/year, with caching and retry."""
+    """
+    Fetch price data from AutoTempest's Price Trends page for a make/model/year.
+
+    Price Trends (/price-trends) includes both current and historical listings,
+    yielding a larger and more representative price distribution than /results.
+    The page renders a JS chart; we intercept any accompanying XHR/fetch calls
+    that carry JSON price data (e.g. chart datasets) in addition to scraping the
+    rendered listing cards and any displayed aggregate stats.
+    """
     cache_key = f"{make.lower()}:{model.lower()}:{year}"
     if cache_key in cache:
         return cache[cache_key]
 
     url = build_at_url(make, model, year, zip_code, radius)
-    console.print(f"[cyan]AutoTempest: fetching {make} {model} {year}...[/cyan]")
+    console.print(f"[cyan]AutoTempest Price Trends: {make} {model} {year}...[/cyan]")
 
     prices: list[int] = []
+    intercepted_json_prices: list[int] = []
+
+    async def handle_at_response(response):
+        """Capture JSON from any XHR/fetch that the Price Trends chart fires."""
+        content_type = response.headers.get("content-type", "")
+        if "json" in content_type and response.status == 200:
+            try:
+                body = await response.json()
+                intercepted_json_prices.extend(_extract_prices_from_json(body))
+            except Exception:
+                pass
 
     for attempt, delay in enumerate([0] + AT_RETRY_DELAYS, start=1):
         if delay:
             await asyncio.sleep(delay)
+        intercepted_json_prices.clear()
+        page.on("response", handle_at_response)
         try:
             response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             if response and response.status == 403:
+                page.remove_listener("response", handle_at_response)
                 console.print(
                     f"[yellow]AutoTempest 403 (attempt {attempt}) — backing off.[/yellow]"
                 )
@@ -662,19 +751,36 @@ async def fetch_at_prices(
                     break
                 continue
 
-            # Wait for results container
+            # Wait for the Price Trends chart or listing results to appear.
+            # The chart (canvas/svg) renders after the initial XHR completes.
             try:
                 await page.wait_for_selector(
-                    ".result-list-item, .no-results", timeout=15000
+                    "canvas, svg.chart, .price-trend, "
+                    ".result-list-item, .no-results",
+                    timeout=20000,
                 )
             except Exception:
                 pass
 
+            # Let the chart finish rendering and any deferred XHR calls settle
             await asyncio.sleep(random.uniform(*REQUEST_DELAY_RANGE))
-            html = await page.content()
-            prices = parse_at_page(html)
+
+            page.remove_listener("response", handle_at_response)
+
+            # Prefer XHR-intercepted prices (direct data source, no DOM parsing needed)
+            if intercepted_json_prices:
+                prices = intercepted_json_prices[:]
+                console.print(
+                    f"[dim]  → {len(prices)} prices from chart API[/dim]"
+                )
+            else:
+                # Fall back to parsing the rendered HTML
+                html = await page.content()
+                prices = parse_at_page(html)
+
             break
         except Exception as e:
+            page.remove_listener("response", handle_at_response)
             console.print(f"[yellow]AT fetch error (attempt {attempt}): {e}[/yellow]")
             if attempt > len(AT_RETRY_DELAYS):
                 break
