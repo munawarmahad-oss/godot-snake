@@ -263,30 +263,54 @@ def build_fb_search_url(lat: float, lon: float, args: argparse.Namespace) -> str
 
 async def manual_fb_login(page: Page, context: BrowserContext, session_file: str) -> None:
     """
-    Open Facebook's login page in a visible browser window and wait for the
-    user to log in manually. Once they press Enter in the terminal the session
-    is saved so future runs skip this step entirely.
+    Open Facebook's login page in a visible browser window and walk the user
+    through two manual checkpoints:
+      1. Log in with email/password
+      2. Dismiss any extra prompts on the Marketplace landing page
+    The session is saved after both steps so future runs skip login entirely.
     """
-    console.print("\n[bold cyan]Manual Facebook Login[/bold cyan]")
-    console.print("A browser window has opened and is showing the Facebook login page.")
-    console.print("Please log in with your email and password in that window.")
-    console.print("When you are fully logged in and can see your Facebook feed,")
-    console.print("[bold]come back here and press Enter to continue.[/bold]\n")
+    # ── Step 1: Login ────────────────────────────────────────────────────────
+    console.print("\n[bold cyan]Step 1 of 2 — Log into Facebook[/bold cyan]")
+    console.print("The browser has opened the Facebook login page.")
+    console.print("Type your email and password in the browser window and log in.")
+    console.print("Handle any verification codes or extra prompts Facebook shows you.")
+    console.print("[bold]Once you can see your Facebook home feed, come back here.[/bold]\n")
 
     await page.goto(FB_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
 
-    # Wait for the user to confirm they are logged in
-    input("Press Enter once you are logged in to Facebook... ")
+    input("Press Enter once you are logged in and can see your feed... ")
 
-    # Verify before saving
-    current_url = page.url
-    if "/login" in current_url or "/checkpoint" in current_url:
-        console.print("[yellow]It looks like you may not be fully logged in yet.[/yellow]")
-        console.print("Please finish logging in, then press Enter again.")
+    # Verify login before moving on
+    if "/login" in page.url or "/checkpoint" in page.url:
+        console.print("[yellow]Looks like you're not fully logged in yet.[/yellow]")
+        console.print("Finish logging in the browser, then press Enter again.")
         input("Press Enter when done... ")
 
+    # ── Step 2: Marketplace landing page ─────────────────────────────────────
+    console.print("\n[bold cyan]Step 2 of 2 — Marketplace Check[/bold cyan]")
+    console.print("Loading Facebook Marketplace...")
+
+    try:
+        await page.goto(
+            "https://www.facebook.com/marketplace/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+    except Exception:
+        pass
+
+    await asyncio.sleep(2.0)
+
+    console.print("The browser is now on the Marketplace page.")
+    console.print("If you see any popups, banners, or permission requests in the")
+    console.print("browser, dismiss them now (close them or click 'Not now').")
+    console.print("[bold]Once the page looks normal and shows car listings, come back here.[/bold]\n")
+
+    input("Press Enter when Marketplace looks good and is showing listings... ")
+
+    # Save the session now that we're confirmed logged in on Marketplace
     await save_session(context, session_file)
-    console.print("[green]Login saved! You won't need to do this again.[/green]\n")
+    console.print("[green]Login saved! Future runs will skip this step.[/green]\n")
 
 
 async def _human_type(page: Page, selector: str, text: str) -> None:
