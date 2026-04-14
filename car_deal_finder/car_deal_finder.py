@@ -144,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Run browser headlessly (use --no-headless to watch)",
     )
     parser.add_argument(
+        "--manual-login", action="store_true", default=False,
+        help="Open the browser so you can log into Facebook yourself, "
+             "then press Enter to continue. Recommended if auto-login fails.",
+    )
+    parser.add_argument(
         "--session-file", default=".fb_session.json",
         help="Playwright storage state file for persisting FB login",
     )
@@ -156,12 +161,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_fb_credentials(args: argparse.Namespace) -> tuple[str, str]:
+    # Credentials are only used as a fallback for automated login.
+    # The preferred path is manual login (--manual-login), which does not
+    # require credentials at all.
     email = os.environ.get("FB_EMAIL", "").strip()
     password = os.environ.get("FB_PASSWORD", "").strip()
-    if not email:
-        email = input("Facebook email: ").strip()
-    if not password:
-        password = getpass.getpass("Facebook password: ")
     return email, password
 
 
@@ -255,6 +259,34 @@ def build_fb_search_url(lat: float, lon: float, args: argparse.Namespace) -> str
         "sortBy": "creation_time_descend",
     }
     return FB_MARKETPLACE_BASE + "?" + urlencode(params)
+
+
+async def manual_fb_login(page: Page, context: BrowserContext, session_file: str) -> None:
+    """
+    Open Facebook's login page in a visible browser window and wait for the
+    user to log in manually. Once they press Enter in the terminal the session
+    is saved so future runs skip this step entirely.
+    """
+    console.print("\n[bold cyan]Manual Facebook Login[/bold cyan]")
+    console.print("A browser window has opened and is showing the Facebook login page.")
+    console.print("Please log in with your email and password in that window.")
+    console.print("When you are fully logged in and can see your Facebook feed,")
+    console.print("[bold]come back here and press Enter to continue.[/bold]\n")
+
+    await page.goto(FB_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+
+    # Wait for the user to confirm they are logged in
+    input("Press Enter once you are logged in to Facebook... ")
+
+    # Verify before saving
+    current_url = page.url
+    if "/login" in current_url or "/checkpoint" in current_url:
+        console.print("[yellow]It looks like you may not be fully logged in yet.[/yellow]")
+        console.print("Please finish logging in, then press Enter again.")
+        input("Press Enter when done... ")
+
+    await save_session(context, session_file)
+    console.print("[green]Login saved! You won't need to do this again.[/green]\n")
 
 
 async def _human_type(page: Page, selector: str, text: str) -> None:
@@ -462,6 +494,7 @@ async def _verify_or_refresh_login(
     email: str,
     password: str,
     session_file: str,
+    manual: bool = False,
 ) -> None:
     """
     Navigate to Facebook home and confirm the session is still valid.
@@ -481,13 +514,15 @@ async def _verify_or_refresh_login(
         logged_in = await _is_logged_in(page)
 
     if not logged_in:
-        console.print("[yellow]Session expired — logging in again...[/yellow]")
-        # Remove stale session file so it gets replaced after fresh login
+        console.print("[yellow]Session expired — need to log in again.[/yellow]")
         stale = pathlib.Path(session_file)
         if stale.exists():
             stale.unlink()
-        await fb_login(page, email, password)
-        await save_session(context, session_file)
+        if manual:
+            await manual_fb_login(page, context, session_file)
+        else:
+            await fb_login(page, email, password)
+            await save_session(context, session_file)
     else:
         console.print("[dim]Session valid.[/dim]")
 
@@ -1206,6 +1241,10 @@ async def main() -> None:
 
     email, password = get_fb_credentials(args)
 
+    # --manual-login always forces the browser to show so the user can type in it
+    if args.manual_login:
+        args.headless = False
+
     # Geocode ZIP
     console.print(f"[dim]Geocoding ZIP {args.zip}...[/dim]")
     try:
@@ -1227,12 +1266,18 @@ async def main() -> None:
         try:
             # --- Facebook login & scraping ---
             if not pathlib.Path(args.session_file).exists():
-                # No saved session — log in fresh
-                await fb_login(fb_page, email, password)
-                await save_session(context, args.session_file)
+                # No saved session — log in
+                if args.manual_login:
+                    await manual_fb_login(fb_page, context, args.session_file)
+                else:
+                    await fb_login(fb_page, email, password)
+                    await save_session(context, args.session_file)
             else:
                 # Session file exists — verify it is still valid and re-login if not
-                await _verify_or_refresh_login(fb_page, context, email, password, args.session_file)
+                await _verify_or_refresh_login(
+                    fb_page, context, email, password,
+                    args.session_file, manual=args.manual_login,
+                )
 
             fb_listings = await scrape_facebook(fb_page, args, lat, lon, email, password)
 
